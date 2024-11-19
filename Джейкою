@@ -1,0 +1,206 @@
+package code.thexsvv.jaycob;
+
+import code.thexsvv.config.ConfigManager;
+import code.thexsvv.helpers.ColorHelper;
+import code.thexsvv.jaycob.command.JCommandExecutor;
+import code.thexsvv.jaycob.config.Configs;
+import code.thexsvv.jaycob.entity.Jaycob;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import java.io.File;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.Map;
+import java.util.UUID;
+import java.util.stream.Collectors;
+import net.citizensnpcs.api.CitizensAPI;
+import net.citizensnpcs.api.event.DespawnReason;
+import net.md_5.bungee.api.ChatMessageType;
+import net.md_5.bungee.api.chat.TextComponent;
+import org.bukkit.Bukkit;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.entity.Player;
+import org.bukkit.event.HandlerList;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
+import org.bukkit.util.Vector;
+import org.bukkit.block.Chest;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.YamlConfiguration;
+import java.util.Random;
+
+public class XSVVJaycobPlugin extends JavaPlugin {
+    private static XSVVJaycobPlugin instance;
+    private Jaycob jaycob;
+    private Map<String, Integer> moneys;
+    private Map<UUID, Integer> time;
+    private Location targetLocation;
+    private String schematicName;
+    private FileConfiguration itemsConfig;
+    private Map<ItemStack, Double> lootItems;
+
+    public XSVVJaycobPlugin() {
+    }
+
+    public void onEnable() {
+        instance = this;
+        this.moneys = Maps.newHashMap();
+        this.time = Maps.newHashMap();
+        this.lootItems = Maps.newHashMap();
+        ConfigManager.setup(this);
+        Configs.init();
+        this.loadConfig();
+        this.loadItemsConfig();
+        this.getServer().getPluginManager().registerEvents(this.jaycob = new Jaycob(), this);
+        this.jaycob.spawn(this.getServer());
+
+        // Телепортируем жителя каждую минуту на морской фонарь
+        this.getServer().getScheduler().runTaskTimer(this, () -> {
+            if (this.jaycob.getNpc() != null) {
+                Location npcLocation = this.jaycob.getNpc().getEntity().getLocation();
+                this.targetLocation = findSeaLantern(npcLocation);
+                if (this.targetLocation != null) {
+                    this.jaycob.getNpc().teleport(this.targetLocation);
+                }
+            }
+        }, 0L, 1200L);
+
+        // Запланируем завершение ивента через 30 минут
+        this.getServer().getScheduler().runTaskLater(this, this::endEvent, 20L * 1800L);
+
+        // Обрабатываем начисление опыта и телепортацию жителя на морской фонарь
+        this.getServer().getScheduler().runTaskTimer(this, () -> {
+            if (this.jaycob.getNpc() != null) {
+                this.getServer().getOnlinePlayers().forEach((player) -> {
+                    int amount = 0;
+                    ListIterator<ItemStack> var4 = player.getInventory().iterator();
+
+                    while (var4.hasNext()) {
+                        ItemStack itemStack = var4.next();
+                        if (itemStack != null && itemStack.getType() == Material.EXPERIENCE_BOTTLE) {
+                            amount += itemStack.getAmount();
+                        }
+                    }
+
+                    if (amount > 0) {
+                        int exp = amount * 10;
+                        player.giveExp(exp);
+                        player.spigot().sendMessage(ChatMessageType.ACTION_BAR, new TextComponent(ColorHelper.colorize(Configs.MAIN_CONFIG.getGetMessage().replace("{exp}", String.valueOf(exp)))));
+                        this.moneys.put(player.getName(), this.moneys.getOrDefault(player.getName(), 0) + exp);
+                        player.addPotionEffect(new PotionEffect(PotionEffectType.GLOWING, 50, 0));
+                        this.time.remove(player.getUniqueId());
+                    } else {
+                        this.time.put(player.getUniqueId(), this.time.getOrDefault(player.getUniqueId(), 0) + 1);
+                        player.spigot().sendMessage(ChatMessageType.ACTION_BAR, new TextComponent(ColorHelper.colorize(Configs.MAIN_CONFIG.getRemoveMessage().replace("{seconds}", String.valueOf(Configs.MAIN_CONFIG.getTime() + 1 - this.time.get(player.getUniqueId()))))));
+                        if (this.time.get(player.getUniqueId()) > Configs.MAIN_CONFIG.getTime()) {
+                            for (int i = 0; i < amount; ++i) {
+                                player.getInventory().removeItem(new ItemStack(Material.EXPERIENCE_BOTTLE));
+                            }
+
+                            this.time.remove(player.getUniqueId());
+                        }
+                    }
+                });
+            }
+        }, 1L, 140L);
+
+        this.getCommand("jaycob").setExecutor(new JCommandExecutor() {
+            @Override
+            public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                if (args.length == 3 && args[0].equalsIgnoreCase("additem") && sender instanceof Player) {
+                    Player player = (Player) sender;
+                    try {
+                        ItemStack item = new ItemStack(Material.valueOf(args[1].toUpperCase()));
+                        double chance = Double.parseDouble(args[2]);
+                        lootItems.put(item, chance);
+                        itemsConfig.set(args[1], chance);
+                        saveItemsConfig();
+                        player.sendMessage("Предмет добавлен в лут с шансом: " + chance);
+                    } catch (Exception e) {
+                        player.sendMessage("Неверный предмет или шанс");
+                    }
+                    return true;
+                }
+                return false;
+            }
+        });
+    }
+
+    private Location findSeaLantern(Location startLocation) {
+        for (int x = -10; x <= 10; x++) {
+            for (int y = -10; y <= 10; y++) {
+                for (int z = -10; z <= 10; z++) {
+                    Location checkLocation = startLocation.clone().add(new Vector(x, y, z));
+                    if (checkLocation.getBlock().getType() == Material.SEA_LANTERN) {
+                        return checkLocation;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private void loadConfig() {
+        FileConfiguration config = this.getConfig();
+        config.addDefault("schematicName", "jakeboy");
+        config.options().copyDefaults(true);
+        saveConfig();
+        this.schematicName = config.getString("schematicName");
+    }
+
+    private void loadItemsConfig() {
+        File itemsFile = new File(instance.getDataFolder(), "items.yml");
+        this.itemsConfig = YamlConfiguration.loadConfiguration(itemsFile);
+        for (String key : itemsConfig.getKeys(false)) {
+            this.lootItems.put(new ItemStack(Material.valueOf(key.toUpperCase())), itemsConfig.getDouble(key));
+        }
+    }
+
+    private void saveItemsConfig() {
+        try {
+            itemsConfig.save(new File(instance.getDataFolder(), "items.yml"));
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void endEvent() {
+        if (this.jaycob.getNpc() != null) {
+            Location npcLocation = this.jaycob.getNpc().getEntity().getLocation();
+            npcLocation.getBlock().setType(Material.CHEST);
+            Chest chest = (Chest) npcLocation.getBlock().getState();
+            Random random = new Random();
+            lootItems.forEach((item, chance) -> {
+                if (random.nextDouble() <= chance) {
+                    chest.getInventory().addItem(item);
+                }
+            });
+            CitizensAPI.getNPCRegistry().despawnNPCs(DespawnReason.PLUGIN);
+            this.jaycob.remove();
+        }
+        this.getServer().getScheduler().cancelTasks(this);
+    }
+
+    public void broadcastJaycobDeath() {
+        List<Integer> sortedMoney = Lists.newArrayList(this.moneys.values());
+        Collections.sort(sortedMoney);
+        List<String> message = Lists.newArrayList(Configs.MAIN_CONFIG.getDeathMessage());
+
+        for (int i = 0; i < message.size(); ++i) {
+            int finalI = i;
+            message = message.stream().map((str) -> {
+                return str.replace(String.format("{name-%d}", finalI + 1), this.moneys.size() > finalI ? this.getNameByMoney(sortedMoney.get(finalI)) : "никто").replace(String.format("{money-%d}", finalI + 1), "" + (this.moneys.size() > finalI ? sortedMoney.get(finalI) : 0));
+            }).collect(Collectors.toList());
+        }
+
+        Iterator<Player> var5 = this.getServer().getOnlinePlayers().iterator();
+
+        while (var5.hasNext()) {
+            Player player =
